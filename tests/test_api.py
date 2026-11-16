@@ -20,6 +20,23 @@ def test_health_returns_version() -> None:
     assert response.json() == {"status": "ok", "version": "1.0.0"}
 
 
+def test_version_returns_commit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GIT_SHA", "abc1234")
+
+    response = client.get("/version")
+
+    assert response.status_code == 200
+    assert response.json() == {"version": "1.0.0", "commit": "abc1234"}
+
+
+def test_version_defaults_to_local(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("GIT_SHA", raising=False)
+
+    response = client.get("/version")
+
+    assert response.json()["commit"] == "local"
+
+
 def test_list_starts_empty() -> None:
     response = client.get("/tasks")
 
