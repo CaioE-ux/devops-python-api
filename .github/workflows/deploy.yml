@@ -1,0 +1,134 @@
+name: CD - Build, ECR e Deploy na EC2
+
+# Executa a cada atualização da main (merge de Pull Request)
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: devops-python-api
+  CONTAINER_NAME: devops-python-api
+  APP_PORT: 80
+
+jobs:
+  # 1. Testes: se falharem, nada abaixo é executado
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  # 2. Build da imagem e publicação no Amazon ECR
+  build-and-push:
+    name: Build e push para o Amazon ECR
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # autenticação na AWS via OIDC (sem chaves fixas)
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      registry: ${{ steps.ecr.outputs.registry }}
+
+    steps:
+      - name: Baixar o código
+        uses: actions/checkout@v6
+
+      - name: Autenticar na AWS (OIDC + IAM Role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login no Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Definir tag da imagem (SHA do commit)
+        id: meta
+        run: |
+          IMAGE="${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Build da imagem Docker
+        run: |
+          docker build \
+            -t "${{ steps.meta.outputs.image }}" \
+            -t "${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest" .
+
+      - name: Push para o ECR
+        run: |
+          docker push "${{ steps.meta.outputs.image }}"
+          docker push "${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest"
+          echo "### 🐳 Imagem publicada" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`${{ steps.meta.outputs.image }}\`" >> "$GITHUB_STEP_SUMMARY"
+
+  # 3. Deploy na instância EC2 via SSH
+  deploy:
+    name: Deploy na EC2
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: http://${{ vars.EC2_HOST }}
+
+    steps:
+      - name: Configurar chave SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/ec2.pem
+          chmod 600 ~/.ssh/ec2.pem
+          ssh-keyscan -H "${{ vars.EC2_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Atualizar contêiner na EC2
+        env:
+          IMAGE: ${{ needs.build-and-push.outputs.image }}
+          REGISTRY: ${{ needs.build-and-push.outputs.registry }}
+        run: |
+          ssh -i ~/.ssh/ec2.pem "${{ vars.EC2_USER }}@${{ vars.EC2_HOST }}" bash -s <<EOS
+          set -euo pipefail
+
+          echo ">> Login do Docker no ECR (credenciais da IAM Role da instância)"
+          aws ecr get-login-password --region $AWS_REGION \
+            | docker login --username AWS --password-stdin $REGISTRY
+
+          echo ">> Baixando a imagem $IMAGE"
+          docker pull $IMAGE
+
+          echo ">> Substituindo o contêiner anterior"
+          docker rm -f $CONTAINER_NAME 2>/dev/null || true
+          docker run -d \
+            --name $CONTAINER_NAME \
+            --restart unless-stopped \
+            -p $APP_PORT:8000 \
+            -e GIT_SHA=${{ github.sha }} \
+            $IMAGE
+
+          echo ">> Limpando imagens antigas"
+          docker image prune -af --filter "until=24h" || true
+
+          echo ">> Verificando se o contêiner está em execução"
+          sleep 5
+          docker ps --filter "name=$CONTAINER_NAME" --filter "status=running" | grep $CONTAINER_NAME
+          EOS
+
+      - name: Verificar a aplicação publicada
+        run: |
+          for i in $(seq 1 10); do
+            if curl -fsS "http://${{ vars.EC2_HOST }}/version"; then
+              echo
+              echo "### 🚀 Deploy concluído" >> "$GITHUB_STEP_SUMMARY"
+              curl -fsS "http://${{ vars.EC2_HOST }}/version" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "Aguardando a aplicação responder... ($i/10)"
+            sleep 5
+          done
+          echo "A aplicação não respondeu após o deploy" && exit 1
+
+      - name: Remover chave SSH
+        if: always()
+        run: rm -f ~/.ssh/ec2.pem
