@@ -12,7 +12,9 @@
           "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
           "token.actions.githubusercontent.com:sub": [
             "repo:CaioE-ux/devops-python-api:ref:refs/heads/main",
-            "repo:CaioE-ux/devops-python-api:environment:production"
+            "repo:CaioE-ux/devops-python-api:environment:production",
+            "repo:CaioE-ux@200692461/devops-python-api@1341255389:ref:refs/heads/main",
+            "repo:CaioE-ux@200692461/devops-python-api@1341255389:environment:production"
           ]
         }
       }

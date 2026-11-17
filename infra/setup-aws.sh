@@ -7,6 +7,8 @@ set -euo pipefail
 
 REGION=us-east-1
 GITHUB_REPO=CaioE-ux/devops-python-api
+# O GitHub passou a incluir IDs imutáveis do dono e do repositório no "sub" do token OIDC
+GITHUB_REPO_IDS=CaioE-ux@200692461/devops-python-api@1341255389
 APP=devops-python-api
 GH_ROLE=github-actions-$APP
 EC2_ROLE=ec2-ecr-readonly
@@ -37,7 +39,9 @@ cat > $TMP/trust.json <<JSON
  "Condition":{"StringEquals":{
    "token.actions.githubusercontent.com:aud":"sts.amazonaws.com",
    "token.actions.githubusercontent.com:sub":["repo:$GITHUB_REPO:ref:refs/heads/main",
-                                             "repo:$GITHUB_REPO:environment:production"]}}}]}
+                                             "repo:$GITHUB_REPO:environment:production",
+                                             "repo:$GITHUB_REPO_IDS:ref:refs/heads/main",
+                                             "repo:$GITHUB_REPO_IDS:environment:production"]}}}]}
 JSON
 cat > $TMP/push.json <<JSON
 {"Version":"2012-10-17","Statement":[
