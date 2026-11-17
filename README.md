@@ -33,7 +33,7 @@ O projeto utiliza FastAPI, pytest, Ruff, GitHub Actions, Docker, Amazon ECR, Ama
 │   ├── DOCKER.md
 │   ├── GITHUB-ACTIONS.md
 │   └── ROTEIRO-AULA.md
-├── infra/                     # user data da EC2 e políticas IAM
+├── infra/                     # script de provisionamento AWS, user data e políticas IAM
 ├── tests/test_api.py          # testes automatizados
 ├── .dockerignore
 ├── .python-version
@@ -174,22 +174,23 @@ A cada merge na `main`, o workflow `.github/workflows/deploy.yml`:
 1. executa o CI completo (se falhar, nada é publicado);
 2. autentica na AWS via **OIDC**, sem access keys guardadas no GitHub;
 3. faz login no **Amazon ECR**, constrói a imagem e publica com a tag do **SHA do commit** (e `latest`);
-4. conecta por **SSH** na **EC2**, autentica o Docker da instância no ECR usando a **IAM Role** da instância;
+4. envia um **SSM Run Command** (AWS Systems Manager) para a **EC2**, que autentica o Docker no ECR usando a **IAM Role** da instância (sem chave SSH e sem porta 22 aberta);
 5. baixa a imagem do commit, substitui o contêiner anterior e inicia a nova versão (porta 80 → 8000);
 6. confirma com `docker ps` e com `GET /version` pela internet.
 
 Nenhum comando manual é executado na EC2 a cada alteração.
 
-Arquitetura, recursos AWS, secrets e verificação: [docs/CD-AWS.md](docs/CD-AWS.md).
+A infraestrutura (ECR, OIDC, roles, security group, EC2 e Elastic IP) é criada pelo script
+`infra/setup-aws.sh`. Arquitetura, recursos AWS, secrets e verificação: [docs/CD-AWS.md](docs/CD-AWS.md).
 
 ### API publicada
 
-- URL: `http://<IP-DA-EC2>`
-- Documentação Swagger: `http://<IP-DA-EC2>/docs`
-- Versão implantada: `http://<IP-DA-EC2>/version`
+- URL: <http://35.174.164.47>
+- Documentação Swagger: <http://35.174.164.47/docs>
+- Versão implantada: <http://35.174.164.47/version>
 
 ```bash
-curl http://<IP-DA-EC2>/version
+curl http://35.174.164.47/version
 # {"version":"1.0.0","commit":"<sha do último commit da main>"}
 ```
 
