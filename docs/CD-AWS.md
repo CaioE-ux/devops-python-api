@@ -19,9 +19,9 @@ Alteração no código → Branch → Pull Request → CI (ruff + pytest + smoke
  ┌──────────────────────────── GitHub ─────────────────────────────┐
  │  Pull Request  → ci.yml                                         │
  │  merge na main → deploy.yml                                     │
- │       test (ci.yml) ─► build-and-push ─────────► deploy         │
+ │       test (ci.yml) ─► build-and-push ─────────► deploy (SSM)   │
  └──────────────────────────┬──────────────────────────┬───────────┘
-              OIDC (STS)    │ docker push               │ SSH (22/TCP)
+              OIDC (STS)    │ docker push               │ SSM Run Command
                             ▼                           ▼
               ┌──────────────────────┐  pull  ┌─────────────────────────────────┐
               │     Amazon ECR       │◄───────┤ Amazon EC2 · Amazon Linux 2023  │
@@ -41,7 +41,7 @@ Disparado a cada `push` na `main` (merge de Pull Request) ou manualmente.
 |---|---|---|
 | `test` | — | Reutiliza o `ci.yml` (`workflow_call`): Ruff, pytest com cobertura ≥ 90% e smoke test do container. |
 | `build-and-push` | `test` | Assume uma IAM Role via **OIDC**, faz login no ECR, constrói a imagem e publica com as tags `<sha do commit>` e `latest`. |
-| `deploy` | `build-and-push` | Por SSH: `aws ecr get-login-password` → `docker login` → `docker pull <imagem:sha>` → remove o contêiner antigo → `docker run` do novo → `docker ps` para confirmar → `curl /version` pela internet. |
+| `deploy` | `build-and-push` | Assume a mesma role via OIDC e envia um **SSM Run Command** (AWS Systems Manager) para a EC2: `aws ecr get-login-password` → `docker login` → `docker pull <imagem:sha>` → remove o contêiner antigo → `docker run` do novo → `docker ps` para confirmar. Depois testa `GET /version` pela internet. |
 
 **Se os testes falharem, `build-and-push` e `deploy` não são executados** (`needs`).
 O `concurrency` impede dois deploys simultâneos.
@@ -53,37 +53,50 @@ Nenhuma credencial está versionada.
 | Onde | Nome | Para quê |
 |---|---|---|
 | Secret | `AWS_ROLE_ARN` | Role assumida pelo GitHub Actions via OIDC (sem access keys) |
-| Secret | `EC2_SSH_KEY` | Chave privada SSH usada no deploy |
 | Variable | `EC2_HOST` | IP público (Elastic IP) da EC2 |
-| Variable | `EC2_USER` | `ec2-user` |
+| Variable | `EC2_INSTANCE_ID` | ID da instância que recebe o deploy |
 
 A EC2 baixa as imagens com a **IAM Role da instância** (`AmazonEC2ContainerRegistryReadOnly`),
 sem nenhuma chave salva no servidor.
 
+### Por que SSM em vez de SSH?
+
+O acesso administrativo para o deploy usa o **AWS Systems Manager**: o agente SSM (já instalado no
+Amazon Linux 2023) mantém uma conexão de saída criptografada com a AWS, e a pipeline envia comandos
+autenticados por IAM. Assim não há chave SSH para guardar ou vazar, a **porta 22 fica fechada** e cada
+deploy fica auditado no histórico do Run Command. A role do GitHub só pode enviar comandos para a
+instância com a tag `Name=devops-python-api`.
+
 ## Recursos AWS (região `us-east-1`)
+
+Todos são criados pelo script `infra/setup-aws.sh`, executado no AWS CloudShell:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/CaioE-ux/devops-python-api/main/infra/setup-aws.sh | bash
+```
 
 | Recurso | Configuração |
 |---|---|
 | ECR | Repositório **privado** `devops-python-api` |
 | Provedor OIDC | `token.actions.githubusercontent.com`, audience `sts.amazonaws.com` |
-| Role do GitHub | Confiança: `infra/github-oidc-trust-policy.json` (só a `main` deste repositório). Permissão: `infra/github-ecr-push-policy.json` |
-| Role da EC2 | `ec2-ecr-readonly` com `AmazonEC2ContainerRegistryReadOnly` |
+| Role do GitHub | Confiança: `infra/github-oidc-trust-policy.json` (só a `main` e o environment `production` deste repositório). Permissões: `infra/github-ecr-push-policy.json` e `infra/github-ssm-deploy-policy.json` |
+| Role da EC2 | `ec2-ecr-readonly` com `AmazonEC2ContainerRegistryReadOnly` e `AmazonSSMManagedInstanceCore` |
 | EC2 | Amazon Linux 2023, `t3.micro`, user data `infra/ec2-user-data.sh` (instala e inicia o Docker) |
-| Security Group | Entrada 22/TCP (SSH) e 80/TCP (HTTP) |
+| Security Group | Entrada somente 80/TCP (HTTP) |
 | Elastic IP | Endereço fixo da instância |
 
 ## Como verificar a versão implantada
 
 ```bash
-curl http://<IP-DA-EC2>/version
+curl http://35.174.164.47/version
 # {"version":"1.0.0","commit":"<sha do commit da main>"}
 ```
 
 - `commit` deve ser igual ao último commit da `main` e à tag da imagem mais recente no ECR.
 - Na aba **Actions**, o resumo de cada deploy mostra a imagem publicada e a resposta de `/version`.
-- Na EC2, `docker ps` mostra o contêiner rodando com a imagem `...:<sha>`.
+- No console da AWS: **Systems Manager → Run Command → Command history** mostra a saída de cada deploy, incluindo o `docker ps`.
 
 ## Limpeza
 
 Depois da avaliação: encerrar a EC2, liberar o Elastic IP, apagar o repositório do ECR,
-as roles e o provedor OIDC.
+as roles, o security group e o provedor OIDC.
