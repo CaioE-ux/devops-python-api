@@ -1,12 +1,13 @@
 # API Python para demonstrar DevOps
 
-Repositório didático para apresentar, em uma única aplicação, três ideias que se conectam:
+Repositório didático para apresentar, em uma única aplicação, quatro ideias que se conectam:
 
 1. uma API HTTP escrita em Python;
 2. integração contínua com GitHub Actions;
-3. execução reproduzível com Docker.
+3. execução reproduzível com Docker;
+4. entrega contínua na AWS: imagem publicada no Amazon ECR e implantada automaticamente em uma instância Amazon EC2.
 
-O projeto utiliza FastAPI, pytest, Ruff, GitHub Actions e Docker. Os dados ficam em memória para manter a atenção da aula no fluxo DevOps, sem introduzir banco de dados.
+O projeto utiliza FastAPI, pytest, Ruff, GitHub Actions, Docker, Amazon ECR, Amazon EC2 e AWS IAM (OIDC e Instance Profile). Os dados ficam em memória para manter a atenção da aula no fluxo DevOps, sem introduzir banco de dados.
 
 ## O que os estudantes devem observar
 
@@ -20,15 +21,19 @@ O projeto utiliza FastAPI, pytest, Ruff, GitHub Actions e Docker. Os dados ficam
 
 ```text
 .
-├── .github/workflows/ci.yml   # pipeline de integração contínua
+├── .github/workflows/
+│   ├── ci.yml                 # integração contínua (Pull Requests)
+│   └── deploy.yml             # entrega contínua: ECR + EC2 (push na main)
 ├── app/
 │   ├── __init__.py
 │   └── main.py                # API FastAPI
 ├── docs/
 │   ├── API.md
+│   ├── CD-AWS.md              # pipeline de deploy e arquitetura AWS
 │   ├── DOCKER.md
 │   ├── GITHUB-ACTIONS.md
 │   └── ROTEIRO-AULA.md
+├── infra/                     # script de provisionamento AWS, user data e políticas IAM
 ├── tests/test_api.py          # testes automatizados
 ├── .dockerignore
 ├── .python-version
@@ -87,6 +92,7 @@ Endpoints:
 |---|---|---|---|
 | GET | `/` | Apresentar a API | `200` |
 | GET | `/health` | Informar saúde e versão | `200` |
+| GET | `/version` | Versão e commit implantado | `200` |
 | GET | `/tasks` | Listar tarefas | `200` |
 | POST | `/tasks` | Criar uma tarefa | `201` |
 | PATCH | `/tasks/{id}/done` | Concluir uma tarefa | `200` ou `404` |
@@ -120,9 +126,13 @@ git push -u origin main
 
 O arquivo `.github/workflows/ci.yml` dispara o pipeline em três situações:
 
-- `push` na branch `main`;
-- `pull_request` destinado à `main`;
-- execução manual pela aba **Actions**.
+- `pull_request` aberto ou atualizado com destino à `main`;
+- execução manual pela aba **Actions**;
+- chamada pelo `deploy.yml` (`workflow_call`), que roda o CI antes de cada deploy.
+
+Etapas: checkout → Python (versão de `.python-version`) → dependências → `ruff check` →
+`ruff format --check` → pytest com cobertura mínima de 90% → relatórios como artefato →
+build e smoke test do container. O resultado (✅/❌) aparece no resumo da execução e no check do Pull Request.
 
 Na aba **Actions**, abra a execução e faça a leitura nesta ordem:
 
@@ -156,6 +166,49 @@ docker compose down
 ```
 
 Veja a leitura detalhada do Dockerfile em [docs/DOCKER.md](docs/DOCKER.md).
+
+## 6. Entrega contínua na AWS (CD)
+
+A cada merge na `main`, o workflow `.github/workflows/deploy.yml`:
+
+1. executa o CI completo (se falhar, nada é publicado);
+2. autentica na AWS via **OIDC**, sem access keys guardadas no GitHub;
+3. faz login no **Amazon ECR**, constrói a imagem e publica com a tag do **SHA do commit** (e `latest`);
+4. envia um **SSM Run Command** (AWS Systems Manager) para a **EC2**, que autentica o Docker no ECR usando a **IAM Role** da instância (sem chave SSH e sem porta 22 aberta);
+5. baixa a imagem do commit, substitui o contêiner anterior e inicia a nova versão (porta 80 → 8000);
+6. confirma com `docker ps` e com `GET /version` pela internet.
+
+Nenhum comando manual é executado na EC2 a cada alteração.
+
+A infraestrutura (ECR, OIDC, roles, security group, EC2 e Elastic IP) é criada pelo script
+`infra/setup-aws.sh`. Arquitetura, recursos AWS, secrets e verificação: [docs/CD-AWS.md](docs/CD-AWS.md).
+
+### API publicada
+
+- URL: <http://35.174.164.47>
+- Documentação Swagger: <http://35.174.164.47/docs>
+- Versão implantada: <http://35.174.164.47/version>
+
+```bash
+curl http://35.174.164.47/version
+# {"version":"1.0.0","commit":"<sha do último commit da main>"}
+```
+
+### Evidências
+
+| Evidência | Arquivo |
+|---|---|
+| CI executado no Pull Request | `docs/evidencias/01-ci-pr.png` |
+| Imagem no ECR com a tag do commit | `docs/evidencias/02-ecr.png` |
+| Pipeline de deploy concluída | `docs/evidencias/03-deploy.png` |
+| Contêiner em execução na EC2 | `docs/evidencias/04-docker-ps.png` |
+| API v1 no navegador | `docs/evidencias/05-api-v1.png` |
+| API v2 após o deploy automático | `docs/evidencias/06-api-v2.png` |
+
+Pull Requests:
+
+- PR 1: implementação da esteira CI/CD (`feature/ci-cd-ec2`)
+- PR 2: nova versão da aplicação (deploy automático)
 
 ## Falhas intencionais para demonstrar
 

@@ -1,0 +1,139 @@
+name: CD - Build, ECR e Deploy na EC2
+
+# Executa a cada atualização da main (merge de Pull Request)
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: devops-python-api
+  CONTAINER_NAME: devops-python-api
+  APP_PORT: 80
+
+jobs:
+  # 1. Testes: se falharem, nada abaixo é executado
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  # 2. Build da imagem e publicação no Amazon ECR
+  build-and-push:
+    name: Build e push para o Amazon ECR
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # autenticação na AWS via OIDC (sem chaves fixas)
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      registry: ${{ steps.ecr.outputs.registry }}
+
+    steps:
+      - name: Baixar o código
+        uses: actions/checkout@v6
+
+      - name: Autenticar na AWS (OIDC + IAM Role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login no Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Definir tag da imagem (SHA do commit)
+        id: meta
+        run: |
+          IMAGE="${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Build da imagem Docker
+        run: |
+          docker build \
+            -t "${{ steps.meta.outputs.image }}" \
+            -t "${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest" .
+
+      - name: Push para o ECR
+        run: |
+          docker push "${{ steps.meta.outputs.image }}"
+          docker push "${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest"
+          echo "### 🐳 Imagem publicada" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`${{ steps.meta.outputs.image }}\`" >> "$GITHUB_STEP_SUMMARY"
+
+  # 3. Deploy na instância EC2 via AWS Systems Manager (SSM Run Command)
+  deploy:
+    name: Deploy na EC2
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    environment:
+      name: production
+      url: http://${{ vars.EC2_HOST }}
+
+    steps:
+      - name: Autenticar na AWS (OIDC + IAM Role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Atualizar contêiner na EC2 (SSM Run Command)
+        env:
+          IMAGE: ${{ needs.build-and-push.outputs.image }}
+          REGISTRY: ${{ needs.build-and-push.outputs.registry }}
+          INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+        run: |
+          jq -n \
+            --arg region "$AWS_REGION" --arg registry "$REGISTRY" --arg image "$IMAGE" \
+            --arg name "$CONTAINER_NAME" --arg port "$APP_PORT" --arg sha "$GITHUB_SHA" \
+            '{commands: [
+              "set -euo pipefail",
+              "echo \">> Login do Docker no ECR (credenciais da IAM Role da instância)\"",
+              "aws ecr get-login-password --region \($region) | docker login --username AWS --password-stdin \($registry)",
+              "echo \">> Baixando a imagem \($image)\"",
+              "docker pull \($image)",
+              "echo \">> Substituindo o contêiner anterior\"",
+              "docker rm -f \($name) 2>/dev/null || true",
+              "docker run -d --name \($name) --restart unless-stopped -p \($port):8000 -e GIT_SHA=\($sha) \($image)",
+              "docker image prune -af --filter until=24h || true",
+              "echo \">> Verificando se o contêiner está em execução\"",
+              "sleep 5",
+              "docker ps --filter name=\($name) --filter status=running | grep \($name)"
+            ]}' > commands.json
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --comment "deploy ${GITHUB_SHA::7}" \
+            --parameters file://commands.json \
+            --query Command.CommandId --output text)
+          echo "Comando SSM: $COMMAND_ID"
+
+          aws ssm wait command-executed --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" || true
+          aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
+            --query '[Status, StandardOutputContent, StandardErrorContent]' --output text
+          STATUS=$(aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
+            --query Status --output text)
+          [ "$STATUS" = "Success" ] || { echo "Deploy falhou na EC2: $STATUS"; exit 1; }
+
+      - name: Verificar a aplicação publicada
+        run: |
+          for i in $(seq 1 12); do
+            if curl -fsS "http://${{ vars.EC2_HOST }}/version"; then
+              echo
+              echo "### 🚀 Deploy concluído" >> "$GITHUB_STEP_SUMMARY"
+              curl -fsS "http://${{ vars.EC2_HOST }}/version" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "Aguardando a aplicação responder... ($i/12)"
+            sleep 5
+          done
+          echo "A aplicação não respondeu após o deploy" && exit 1

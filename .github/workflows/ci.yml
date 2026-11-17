@@ -1,17 +1,17 @@
 name: CI Python
 
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
   workflow_dispatch:
+  # Reutilizado pelo deploy.yml: o deploy só acontece se este CI passar
+  workflow_call:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -47,6 +47,16 @@ jobs:
             --cov-report=term-missing \
             --cov-report=xml:coverage.xml \
             --junitxml=reports/junit.xml
+
+      - name: Resumo da execução
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "## ✅ Qualidade e testes aprovados" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## ❌ Qualidade ou testes falharam" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "Commit: \`${{ github.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Guardar relatórios da execução
         if: always()
